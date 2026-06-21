@@ -4,14 +4,27 @@ No game logic lives here. Only wiring and startup.
 """
 
 import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
 
+from app.core.devlog.setup import init_dev_logging
 from app.game_client import GameClient
 from app.registry import register_raw_tools, register_skills
 from app.transports.stub import StubTransport
 
-mcp = FastMCP(name="spacemolt-gateway")
+_DEV_LOG_PORT = int(os.environ.get("DEVLOG_PORT", "7788"))
+
+
+@asynccontextmanager
+async def lifespan(server: FastMCP) -> AsyncIterator[None]:
+    """Start background services when the gateway boots."""
+    await init_dev_logging(port=_DEV_LOG_PORT)
+    yield
+
+
+mcp = FastMCP(name="spacemolt-gateway", lifespan=lifespan)
 
 
 def build_client() -> GameClient:
