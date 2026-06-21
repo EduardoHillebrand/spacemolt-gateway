@@ -46,13 +46,17 @@ async def _handle_client(websocket: ServerConnection, bus: LogBus) -> None:
     bus.subscribe(subscriber)
     log.info("devlog client connected (level=%s threshold=%d)", level_str, threshold)
 
-    try:
+    async def send_loop() -> None:
         while True:
             message = await queue.get()
             await websocket.send(message)
-    except Exception:
-        pass
+
+    send_task = asyncio.create_task(send_loop())
+    try:
+        # wait_closed() returns as soon as the connection is gone
+        await websocket.wait_closed()
     finally:
+        send_task.cancel()
         bus.unsubscribe(subscriber)
         log.info("devlog client disconnected")
 
