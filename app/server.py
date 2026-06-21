@@ -1,29 +1,40 @@
-"""SpaceMolt Gateway — MCP server entry point.
+"""SpaceMolt Gateway -- MCP server entry point.
 
-Responsibilities:
-- Create the FastMCP instance.
-- Register raw proxy tools and skills (via registry).
-- Run the server over stdio.
-
-No game logic lives here.
+No game logic lives here. Only wiring and startup.
 """
+
+import os
 
 from mcp.server.fastmcp import FastMCP
 
-# ---------------------------------------------------------------------------
-# Server instance — imported by registry and by tests
-# ---------------------------------------------------------------------------
+from app.game_client import GameClient
+from app.registry import register_raw_tools, register_skills
+from app.transports.stub import StubTransport
 
 mcp = FastMCP(name="spacemolt-gateway")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def build_client() -> GameClient:
+    """Build a GameClient from environment variables.
+
+    SPACEMOLT_SESSION_ID: session from spacemolt_auth (required for live use).
+    Falls back to stub-session for local inspection.
+    """
+    session_id = os.environ.get("SPACEMOLT_SESSION_ID", "stub-session")
+    transport = StubTransport()
+    return GameClient(transport=transport, session_id=session_id)
+
+
+def register_all(client: GameClient) -> None:
+    """Register all raw proxy tools and skills on the global mcp instance."""
+    register_raw_tools(mcp, client)
+    register_skills(mcp, client)
 
 
 def main() -> None:
-    """Run the gateway over stdio (used by Claude / MCP clients)."""
+    """Build the client, register tools, and run the gateway over stdio."""
+    client = build_client()
+    register_all(client)
     mcp.run(transport="stdio")
 
 

@@ -28,35 +28,52 @@ e gasta token decidindo coisa óbvia. O gateway empacota essas sequências em
 **skills de alto nível** que já vêm com a lógica pronta. A LLM pede "minera e
 vende", o gateway faz o resto.
 
-## Como este projeto é construído
+## Como subir
 
-Ele é um exercício de **Spec Driven Development (SDD)**:
-a especificação vem antes do código. Tudo está em `.specs/`.
+### 1. Instalar dependências
 
-Ordem: `spec.md` (o quê/porquê) → `plan.md` (o como) → `tasks.md` (passos pequenos).
-Cada passo de `tasks.md` vira uma branch no Git.
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux / macOS
+source .venv/bin/activate
 
-Comece lendo: `.specs/README.md` e `.specs/constitution.md`.
-
-## Stack
-
-- Python 3.11+
-- Servidor MCP (FastMCP / SDK MCP de Python)
-- Sem nuvem: roda local, igual ao resto do ecossistema.
-
-## Estrutura (quando o código existir)
-
+pip install -e ".[dev]"
 ```
-app/
-  server.py          # registra as ferramentas e sobe o MCP
-  game_client.py     # camada fina que chama o MCP cru do SpaceMolt
-  skills/
-    mining/
-      planner.py     # monta o plano (função pura)
-      executor.py    # roda o plano (recebe o game_client)
-      schema.py      # tipos do plano e do resultado
-  core/
-    plan.py          # tipos genéricos de Plano/Passo, reusados por toda skill
-tests/
-  skills/mining/...
+
+### 2. Configurar
+
+Antes de subir com uma sessão real do SpaceMolt, exporte o ID de sessão:
+
+```bash
+# Windows (PowerShell)
+$env:SPACEMOLT_SESSION_ID = "seu-session-id-aqui"
+
+# Linux / macOS
+export SPACEMOLT_SESSION_ID="seu-session-id-aqui"
 ```
+
+O session ID vem de `spacemolt_auth` (action=login ou register).
+Se a variável não estiver definida, o gateway sobe em modo stub — útil para
+inspecionar a estrutura das ferramentas sem se conectar ao jogo.
+
+### 3. Rodar
+
+```bash
+python -m app.server
+```
+
+O gateway fica ouvindo via **stdio**, o transporte padrão do MCP.
+
+### 4. Conectar
+
+**Claude Desktop** — adicione em `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "spacemolt-gateway": {
+      "command": "python",
+      "args": ["-m", "app.server"],
+      "cwd": "/cami
