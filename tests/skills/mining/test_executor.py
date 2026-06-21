@@ -1,6 +1,11 @@
 """Tests for mining/executor.py.
 
 Uses FakeGameClient to simulate cargo filling up without a live game.
+
+FakeGameClient mirrors the real SpaceMolt response format:
+  mine  -> {"details": {"quantity": N}, "ship": {"cargo_used": X, "cargo_capacity": Y},
+             "cargo": [{"item_id": "iron_ore", "quantity": N, "size": 1}]}
+  sell  -> {"details": {"total_earned": F, "quantity_sold": N, "unsold": 0}}
 """
 
 from __future__ import annotations
@@ -15,7 +20,10 @@ from app.skills.mining.schema import MiningState, Plan, Step
 # ---------------------------------------------------------------------------
 
 class FakeGameClient:
-    """Simulates the game: cargo fills after a set number of mine calls."""
+    """Simulates the game: cargo fills after a set number of mine calls.
+
+    Response format matches real SpaceMolt JSON (nested dicts).
+    """
 
     def __init__(
         self,
@@ -37,22 +45,33 @@ class FakeGameClient:
             added = min(self.ore_per_mine, self.capacity - self.cargo_used)
             self.cargo_used += added
             return {
-                "quantity": added,
-                "cargo_used": self.cargo_used,
-                "cargo_capacity": self.capacity,
+                "details": {"quantity": added},
+                "ship": {
+                    "cargo_used": self.cargo_used,
+                    "cargo_capacity": self.capacity,
+                },
+                "cargo": [
+                    {"item_id": "iron_ore", "quantity": self.cargo_used, "size": 1}
+                ],
             }
 
         if action == "travel":
-            return {"location": kwargs.get("id", "")}
+            return {"location": {"poi_id": kwargs.get("id", "")}}
 
         if action == "dock":
-            return {"status": "docked"}
+            return {"details": {"action": "dock"}}
 
         if action == "sell":
             sold = self.cargo_used
             credits = float(sold * 10)
             self.cargo_used = 0
-            return {"credits_earned": credits, "sold": sold}
+            return {
+                "details": {
+                    "total_earned": credits,
+                    "quantity_sold": sold,
+                    "unsold": 0,
+                }
+            }
 
         return {}
 
@@ -146,7 +165,11 @@ class TestExecutorSafetyCap:
                 self.calls.append((tool, kwargs))
                 if kwargs.get("action") == "mine":
                     # Always returns 0 ore -- cargo never fills
-                    return {"quantity": 0, "cargo_used": 0, "cargo_capacity": 100}
+                    return {
+                        "details": {"quantity": 0},
+                        "ship": {"cargo_used": 0, "cargo_capacity": 100},
+                        "cargo": [],
+                    }
                 return await super().call(tool, **kwargs)
 
         client = NeverFillsClient()
