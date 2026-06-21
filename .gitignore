@@ -10,8 +10,6 @@ venv/
 .env
 *.session
 config.local.*
+.github_token
 
-# SO / editor
-.DS_Store
-.idea/
-.vscode/
+# SO / edito
