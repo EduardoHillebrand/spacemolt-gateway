@@ -198,3 +198,47 @@ app/
   skills/            # skills de alto nivel -- feature 0002+
 tests/
 ```
+
+## Ferramentas disponíveis
+
+O gateway expõe dois tipos de tool:
+
+### Proxies automáticos (descobertos no boot)
+
+Ao subir, o gateway chama `list_tools()` no transport e registra um proxy para
+cada tool descoberto. Toda chamada é logada automaticamente no devlog.
+
+| Tool | Params obrigatórios | Params opcionais |
+|------|---------------------|------------------|
+| `spacemolt` | `action` | `id`, `quantity`, `price`, `message` |
+| `spacemolt_auth` | `action` | `username`, `password`, `registration_code` |
+| `spacemolt_market` | `action` | `id`, `quantity`, `price_each`, `order_id` |
+| `spacemolt_ship` | `action` | `id`, `slot`, `ship_name` |
+| `spacemolt_facility` | `action` | `id`, `item_id`, `quantity` |
+
+O `session_id` é **sempre injetado automaticamente** — não aparece nos params.
+
+### Skills de alto nível
+
+| Tool | O que faz |
+|------|-----------|
+| `mining_run(home_base?)` | Minera até encher, volta pra base, vende tudo |
+
+### Configuração no Claude Desktop
+
+Configure **apenas o gateway** — não o SpaceMolt diretamente:
+
+```json
+{
+  "mcpServers": {
+    "spacemolt-gateway": {
+      "command": "D:\\Projects\\spacemolt-gateway\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "app.server"],
+      "cwd": "D:\\Projects\\spacemolt-gateway",
+      "env": {
+        "SPACEMOLT_SESSION_ID": "seu-session-id"
+      }
+    }
+  }
+}
+```
