@@ -66,6 +66,8 @@ python -m app.server
 ```
 
 O gateway fica ouvindo via **stdio**, o transporte padrao do MCP.
+Ao subir, o canal de log WebSocket tambem sobe automaticamente na porta 7788
+(ou na porta definida por `DEVLOG_PORT`).
 
 ### 4. Conectar
 
@@ -108,6 +110,58 @@ get_status()
 # modo real  -> dados reais do SpaceMolt
 ```
 
+## Canal de log ao vivo (devlog)
+
+Quando o gateway sobe, um servidor WebSocket sobe junto na porta **7788**.
+Qualquer cliente WebSocket pode assinar um nivel e acompanhar os logs ao vivo.
+
+### Niveis disponiveis
+
+| Assinar | Recebe |
+|---------|--------|
+| `error` | so error |
+| `warning` | warning + error |
+| `info` | info + warning + error (tudo) |
+
+### Como conectar
+
+Com `websocat` (instale com `cargo install websocat` ou baixe o binario):
+
+```bash
+# ver tudo
+websocat "ws://localhost:7788/?level=info"
+
+# so erros
+websocat "ws://localhost:7788/?level=error"
+```
+
+No navegador (console do DevTools):
+
+```js
+const ws = new WebSocket("ws://localhost:7788/?level=info");
+ws.onmessage = e => console.log(JSON.parse(e.data));
+```
+
+### Formato da mensagem
+
+Cada linha e um JSON com os campos:
+
+```json
+{
+  "level":   "info",
+  "module":  "app.skills.mining.executor",
+  "message": "mine_until: volta 3, cargo 42/100",
+  "time":    "2026-06-21T12:34:56.789000+00:00"
+}
+```
+
+### Comportamento
+
+- Conectou depois? Perdeu o que passou. Nao ha historico.
+- Sem cliente conectado? Zero overhead -- nenhum dado e guardado.
+- Fila cheia? O log mais antigo e descartado. O gateway nunca trava.
+- Porta diferente? Defina `DEVLOG_PORT` antes de subir.
+
 ## Como este projeto e construido
 
 Spec Driven Development (SDD): a especificacao vem antes do codigo.
@@ -121,6 +175,7 @@ Comece lendo: `.specs/README.md` e `.specs/constitution.md`.
 
 - Python 3.11+
 - FastMCP (SDK MCP de Python)
+- websockets >= 13 (canal de log)
 - Sem nuvem: roda local.
 
 ## Estrutura
@@ -134,6 +189,12 @@ app/
     stub.py          # transport de desenvolvimento (sem conexao real)
   core/
     errors.py        # erros do gateway (PreconditionError)
+    devlog/          # canal de log WebSocket ao vivo
+      levels.py      # regra de filtro por nivel
+      bus.py         # fan-out para assinantes
+      handler.py     # logging.Handler nao-bloqueante
+      ws_server.py   # servidor WebSocket
+      setup.py       # init_dev_logging() -- ponto de entrada
   skills/            # skills de alto nivel -- feature 0002+
 tests/
 ```
