@@ -1,4 +1,4 @@
-"""Tool registry — plugs raw proxy tools and skills into the MCP server.
+"""Tool registry -- plugs raw proxy tools and skills into the MCP server.
 
 Pattern for adding a new raw tool:
   1. Define an async function inside register_raw_tools.
@@ -54,5 +54,5 @@ def register_skills(mcp: FastMCP, client: GameClient) -> None:
     Each skill module exposes a register(mcp, client) function.
     Add calls here as new skills are built.
     """
-    # Skills will be added here in future features (e.g. mining skill).
-    pass
+    from app.skills.mining import tool as mining_tool
+    mining_tool.register(mcp, client)
