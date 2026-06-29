@@ -3,11 +3,15 @@
 No logic here — just data shapes.
 
 Mapping to SpaceMolt get_status fields:
-  MiningState.has_mining_laser  <- modules[] contains type "mining_laser"
-  MiningState.cargo_used        <- cargo.used
-  MiningState.cargo_capacity    <- cargo.capacity
-  MiningState.at_minable_poi    <- location.poi.minable == true
-  MiningState.home_base_poi_id  <- location.base_poi_id (last docked base)
+  MiningState.has_mining_laser      <- modules[] contains type "mining_laser"
+  MiningState.cargo_used            <- cargo.used
+  MiningState.cargo_capacity        <- cargo.capacity
+  MiningState.at_minable_poi        <- location.poi.minable == true
+  MiningState.home_base_poi_id      <- location.base_poi_id (last docked base)
+  MiningState.fuel_current          <- ship.fuel_current / Fuel: X/Y
+  MiningState.fuel_capacity         <- ship.fuel_capacity / Fuel: X/Y
+  MiningState.fuel_per_jump_estimate <- conservative cost of one travel
+  MiningState.other_minable_poi_ids  <- system.pois where minable=true
 """
 
 from __future__ import annotations
@@ -38,6 +42,20 @@ class MiningState:
     home_base_poi_id: str
     """POI id of the base to return to for selling (last docked station)."""
 
+    # --- Resilience fields (0006) ---
+
+    fuel_current: int = 0
+    """Current fuel units. 0 = unknown (fuel check skipped)."""
+
+    fuel_capacity: int = 100
+    """Maximum fuel capacity."""
+
+    fuel_per_jump_estimate: int = 0
+    """Conservative fuel cost per travel/jump. 0 = disable fuel checks."""
+
+    other_minable_poi_ids: list[str] = field(default_factory=list)
+    """POI ids of other minable locations in the same system (for relocation)."""
+
     @property
     def cargo_free(self) -> int:
         return self.cargo_capacity - self.cargo_used
@@ -56,13 +74,21 @@ class Step:
     """One step in the mining plan."""
 
     op: str
-    """Operation name. One of: mine_until, travel, dock, sell_all_ore."""
+    """Operation name.
+
+    One of:
+      mine_until_depleted_or_full  -- mine loop with depletion/relocation/survey
+      survey_system                -- scan for hidden deposits
+      travel                       -- move to a POI
+      dock                         -- dock at current station
+      sell_all_ore                 -- sell all tracked cargo items
+    """
 
     target: str | None = None
     """POI id for the travel op; None for other ops."""
 
     condition: str | None = None
-    """Loop condition for mine_until. Always 'cargo_full'."""
+    """Legacy field kept for backward compatibility."""
 
 
 @dataclass
@@ -91,7 +117,7 @@ class MiningResult:
     """False if a precondition failed or the run was aborted."""
 
     cycles: int = 0
-    """Number of mine() calls that succeeded."""
+    """Number of mine() calls that extracted ore > 0."""
 
     ore_collected: int = 0
     """Total cargo units collected during this run."""
@@ -104,6 +130,17 @@ class MiningResult:
 
     failure_reason: str | None = None
     """Human-readable explanation when ok=False."""
+
+    # --- Resilience fields (0006) ---
+
+    relocations: int = 0
+    """Number of times the ship moved to a different POI due to depletion."""
+
+    surveys: int = 0
+    """Number of survey_system calls made to look for hidden deposits."""
+
+    stop_reason: str = "cargo_full"
+    """Why the mining loop ended: 'cargo_full' | 'system_depleted' | 'low_fuel'."""
 
     @classmethod
     def failed(cls, reason: str) -> "MiningResult":
