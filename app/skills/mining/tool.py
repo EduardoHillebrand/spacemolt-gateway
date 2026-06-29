@@ -1,8 +1,8 @@
 """Mining skill tool: registers mining_run on the MCP gateway.
 
 This module is the glue layer. It:
-  1. Reads the game state via GameClient.
-  2. Parses it into a MiningState.
+  1. Reads the game state via GameClient (get_status + optional get_system).
+  2. Parses it into a MiningState (including fuel and other POIs).
   3. Calls the planner to build a Plan.
   4. Calls the executor to run the Plan.
   5. Returns a human-readable summary.
@@ -25,10 +25,14 @@ SpaceMolt get_status returns formatted TEXT (not JSON). Example:
   ...
 
 _parse_mining_state detects text vs JSON and dispatches accordingly.
+
+For 0006 resilience: also calls get_system to find other minable POIs in the
+system so the executor can relocate when the current POI depletes.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -43,15 +47,19 @@ from app.skills.mining.schema import MiningResult, MiningState
 log = logging.getLogger(__name__)
 
 _DEFAULT_HOME_BASE = "confederacy_central_command"
+# Conservative fuel estimate per jump — updated from get_status if fuel data found.
+_DEFAULT_FUEL_PER_JUMP = 0  # 0 = disabled until we can read real values
 
 
 def register(mcp: FastMCP, client: GameClient) -> None:
     """Register the mining_run tool on the gateway."""
 
     @mcp.tool(description=(
-        "Mine ore until the cargo is full, then travel to home_base, "
-        "dock, and sell all ore. Returns a summary with credits earned. "
-        "Preconditions: mining laser installed, at a minable POI, cargo not full. "
+        "Mine ore until the cargo is full (or system is depleted / fuel is low), "
+        "then travel to home_base, dock, and sell all ore. "
+        "Returns a summary with credits earned and resilience stats. "
+        "Preconditions: mining laser installed, at a minable POI, cargo not full, "
+        "sufficient fuel (when fuel data is available). "
         "home_base: POI id of the station to sell at "
         "(default: confederacy_central_command)."
     ))
@@ -62,24 +70,76 @@ def register(mcp: FastMCP, client: GameClient) -> None:
         raw = await client.call("spacemolt", action="get_status")
         state = _parse_mining_state(raw, home_base=home_base)
 
+        # 2. Try to enrich with other minable POIs from get_system
+        state = await _enrich_with_system_pois(state, client)
+
         log.info(
-            "mining_run: state parsed — laser=%s minable=%s cargo=%d/%d home=%s",
+            "mining_run: state parsed — laser=%s minable=%s cargo=%d/%d "
+            "fuel=%d/%d fuel_jump=%d home=%s other_pois=%s",
             state.has_mining_laser, state.at_minable_poi,
-            state.cargo_used, state.cargo_capacity, state.home_base_poi_id,
+            state.cargo_used, state.cargo_capacity,
+            state.fuel_current, state.fuel_capacity,
+            state.fuel_per_jump_estimate, state.home_base_poi_id,
+            state.other_minable_poi_ids,
         )
 
-        # 2. Build plan (precondition check happens here)
+        # 3. Build plan (precondition check happens here)
         plan = build_mining_plan(state)
 
         if not plan.ok:
             log.info("mining_run: precondition failed — %s", plan.failure_reason)
             return f"Nao foi possivel iniciar mineracao: {plan.failure_reason}"
 
-        # 3. Execute
-        result = await run_mining_plan(plan, client)
+        # 4. Execute
+        result = await run_mining_plan(plan, client, state)
 
-        # 4. Format summary
+        # 5. Format summary
         return _format_result(result)
+
+
+async def _enrich_with_system_pois(state: MiningState, client: GameClient) -> MiningState:
+    """Try to add other minable POI ids from get_system.
+
+    On failure, returns the original state unchanged (non-critical).
+    """
+    if state.other_minable_poi_ids:
+        return state  # already populated
+
+    try:
+        raw_system = await client.call("spacemolt", action="get_system")
+        other_pois = _parse_system_pois(raw_system)
+        if other_pois:
+            log.info("mining_run: system POIs found: %s", other_pois)
+            return dataclasses.replace(state, other_minable_poi_ids=other_pois)
+    except Exception as exc:
+        log.warning("_enrich_with_system_pois: failed to get system POIs: %s", exc)
+
+    return state
+
+
+def _parse_system_pois(raw) -> list[str]:
+    """Extract minable POI ids from a get_system response.
+
+    Handles text and dict formats. Returns empty list on failure.
+    """
+    if isinstance(raw, dict):
+        pois = (
+            raw.get("pois")
+            or (raw.get("system") or {}).get("pois")
+            or []
+        )
+        return [
+            p.get("id") or p.get("poi_id", "")
+            for p in pois
+            if isinstance(p, dict) and p.get("minable", False)
+        ]
+
+    # Text format — simple regex: look for minable POI ids
+    # SpaceMolt text might include lines like: "sol_belt_1 (Asteroid Belt) [minable]"
+    if isinstance(raw, str):
+        return re.findall(r'(\w+)\s+\([^)]+\)\s+\[minable\]', raw)
+
+    return []
 
 
 def _parse_mining_state(raw, *, home_base: str = _DEFAULT_HOME_BASE) -> MiningState:
@@ -92,19 +152,16 @@ def _parse_mining_state(raw, *, home_base: str = _DEFAULT_HOME_BASE) -> MiningSt
     Every field has a safe default so parsing never crashes.
     """
     if isinstance(raw, str):
-        # Try JSON first (future-proofing if SpaceMolt changes format)
         try:
             raw_dict = json.loads(raw)
             return _parse_from_dict(raw_dict, home_base=home_base)
         except (json.JSONDecodeError, TypeError):
             pass
-        # Current SpaceMolt format: formatted text
         return _parse_from_text(raw, home_base=home_base)
 
     if isinstance(raw, dict):
         return _parse_from_dict(raw, home_base=home_base)
 
-    # Unknown format — safe defaults
     log.warning("_parse_mining_state: unexpected raw type %s", type(raw).__name__)
     return MiningState(
         has_mining_laser=False,
@@ -120,13 +177,12 @@ def _parse_from_text(text: str, *, home_base: str) -> MiningState:
 
     Patterns (all case-sensitive, matching observed output):
       Cargo: X/Y             -> cargo_used, cargo_capacity
+      Fuel: X/Y              -> fuel_current, fuel_capacity
       mining_laser (in text) -> has_mining_laser
       Resources (N):         -> at_minable_poi (section only present at minable POIs)
     """
-    # has_mining_laser: 'mining_laser' appears in the Modules table
     has_laser = bool(re.search(r'\bmining_laser', text))
 
-    # cargo: "Cargo: X/Y" on the stats line
     cargo_used = 0
     cargo_capacity = 1
     cargo_match = re.search(r'Cargo:\s*(\d+)/(\d+)', text)
@@ -134,7 +190,13 @@ def _parse_from_text(text: str, *, home_base: str) -> MiningState:
         cargo_used = int(cargo_match.group(1))
         cargo_capacity = int(cargo_match.group(2))
 
-    # at_minable_poi: the Resources section only appears at asteroid belts / minable POIs
+    fuel_current = 0
+    fuel_capacity = 0
+    fuel_match = re.search(r'Fuel:\s*(\d+)/(\d+)', text)
+    if fuel_match:
+        fuel_current = int(fuel_match.group(1))
+        fuel_capacity = int(fuel_match.group(2))
+
     at_minable = bool(re.search(r'^Resources \(\d+\):', text, re.MULTILINE))
 
     return MiningState(
@@ -143,12 +205,14 @@ def _parse_from_text(text: str, *, home_base: str) -> MiningState:
         cargo_capacity=cargo_capacity,
         at_minable_poi=at_minable,
         home_base_poi_id=home_base,
+        fuel_current=fuel_current,
+        fuel_capacity=fuel_capacity,
+        fuel_per_jump_estimate=_DEFAULT_FUEL_PER_JUMP,
     )
 
 
 def _parse_from_dict(raw: dict, *, home_base: str) -> MiningState:
     """Parse dict-based state (JSON format, future-proofing)."""
-    # modules: check for mining laser by type name
     modules = raw.get("modules") or []
     has_laser = any(
         "mining_laser" in str(m.get("type", "")).lower()
@@ -156,7 +220,6 @@ def _parse_from_dict(raw: dict, *, home_base: str) -> MiningState:
         if isinstance(m, dict)
     )
 
-    # cargo
     cargo_raw = raw.get("cargo") or {}
     if isinstance(cargo_raw, dict):
         cargo_used = int(cargo_raw.get("used", cargo_raw.get("current", 0)))
@@ -165,7 +228,10 @@ def _parse_from_dict(raw: dict, *, home_base: str) -> MiningState:
         cargo_used = 0
         cargo_capacity = 1
 
-    # location / poi
+    ship = raw.get("ship") or {}
+    fuel_current = int(ship.get("fuel_current", 0))
+    fuel_capacity = int(ship.get("fuel_capacity", 0))
+
     location = raw.get("location") or {}
     if isinstance(location, dict):
         poi = location.get("poi") or {}
@@ -181,6 +247,9 @@ def _parse_from_dict(raw: dict, *, home_base: str) -> MiningState:
         cargo_capacity=cargo_capacity,
         at_minable_poi=at_minable,
         home_base_poi_id=home_base,
+        fuel_current=fuel_current,
+        fuel_capacity=fuel_capacity,
+        fuel_per_jump_estimate=_DEFAULT_FUEL_PER_JUMP,
     )
 
 
@@ -188,10 +257,17 @@ def _format_result(result: MiningResult) -> str:
     if not result.ok:
         return f"Mineracao falhou: {result.failure_reason}"
 
-    return (
-        f"Mineracao concluida!\n"
-        f"  Ciclos de mineracao : {result.cycles}\n"
-        f"  Minerio coletado    : {result.ore_collected} unidades\n"
-        f"  Creditos ganhos     : {result.credits_earned:.2f}\n"
-        f"  Localização final   : {result.final_location}"
-    )
+    lines = [
+        "Mineracao concluida!",
+        f"  Ciclos de mineracao : {result.cycles}",
+        f"  Minerio coletado    : {result.ore_collected} unidades",
+        f"  Creditos ganhos     : {result.credits_earned:.2f}",
+        f"  Localização final   : {result.final_location}",
+        f"  Motivo de parada    : {result.stop_reason}",
+    ]
+    if result.relocations > 0:
+        lines.append(f"  Realocacoes         : {result.relocations}")
+    if result.surveys > 0:
+        lines.append(f"  Surveys realizados  : {result.surveys}")
+
+    return "\n".join(lines)
