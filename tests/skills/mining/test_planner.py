@@ -13,6 +13,11 @@ def make_state(**overrides) -> MiningState:
         cargo_capacity=100,
         at_minable_poi=True,
         home_base_poi_id="base-alpha",
+        # Fuel fields — default 0 means fuel check is disabled
+        fuel_current=0,
+        fuel_capacity=100,
+        fuel_per_jump_estimate=0,
+        other_minable_poi_ids=[],
     )
     return MiningState(**{**defaults, **overrides})
 
@@ -26,11 +31,10 @@ class TestHappyPath:
         plan = build_mining_plan(make_state())
         assert len(plan.steps) == 4
 
-    def test_first_step_is_mine_until_cargo_full(self):
+    def test_first_step_is_mine_until_depleted_or_full(self):
         plan = build_mining_plan(make_state())
         step = plan.steps[0]
-        assert step.op == "mine_until"
-        assert step.condition == "cargo_full"
+        assert step.op == "mine_until_depleted_or_full"
 
     def test_second_step_is_travel_to_home_base(self):
         plan = build_mining_plan(make_state(home_base_poi_id="station-7"))
@@ -86,6 +90,53 @@ class TestPreconditions:
         assert "laser" in plan.failure_reason.lower()
 
     def test_partial_cargo_is_valid(self):
-        """Cargo that's not full should not block the plan."""
         plan = build_mining_plan(make_state(cargo_used=99, cargo_capacity=100))
         assert plan.ok is True
+
+
+class TestFuelPrecondition:
+    def test_fuel_zero_estimate_skips_fuel_check(self):
+        """fuel_per_jump_estimate=0 → fuel check disabled, plan passes."""
+        plan = build_mining_plan(make_state(fuel_current=0, fuel_per_jump_estimate=0))
+        assert plan.ok is True
+
+    def test_sufficient_fuel_passes(self):
+        plan = build_mining_plan(make_state(
+            fuel_current=50,
+            fuel_per_jump_estimate=10,  # need 20, have 50
+        ))
+        assert plan.ok is True
+
+    def test_exactly_minimum_fuel_passes(self):
+        """fuel_current == fuel_per_jump_estimate * 2 should pass."""
+        plan = build_mining_plan(make_state(
+            fuel_current=20,
+            fuel_per_jump_estimate=10,
+        ))
+        assert plan.ok is True
+
+    def test_low_fuel_returns_failed_plan(self):
+        plan = build_mining_plan(make_state(
+            fuel_current=5,
+            fuel_per_jump_estimate=10,  # need 20, have only 5
+        ))
+        assert plan.ok is False
+        assert plan.steps == []
+
+    def test_low_fuel_reason_mentions_fuel(self):
+        plan = build_mining_plan(make_state(
+            fuel_current=5,
+            fuel_per_jump_estimate=10,
+        ))
+        assert "fuel" in plan.failure_reason.lower()
+
+    def test_fuel_check_before_laser_check(self):
+        """Low fuel should be reported before missing laser."""
+        plan = build_mining_plan(make_state(
+            has_mining_laser=False,
+            fuel_current=0,
+            fuel_per_jump_estimate=10,
+        ))
+        # Low fuel fires before laser check
+        assert plan.ok is False
+        assert "fuel" in plan.failure_reason.lower()
