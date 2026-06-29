@@ -12,4 +12,7 @@ venv/
 config.local.*
 .github_token
 
-# SO / edito
+# SO / editor
+.DS_Store
+.idea/
+.vscode/
