@@ -15,6 +15,7 @@ crashing the gateway (fallback to whatever tools were already registered).
 from __future__ import annotations
 
 import inspect
+import keyword
 import logging
 from typing import Any
 
@@ -84,10 +85,20 @@ def _make_proxy(client: GameClient, tool: ToolSchema):
     """
     tool_name = tool.name
 
+    # Map sanitized param names back to original SpaceMolt names.
+    # e.g. "class_" -> "class" (Python keyword avoidance).
+    _orig_names: dict[str, str] = {}
+    for p in tool.params:
+        safe = p.name + "_" if keyword.iskeyword(p.name) else p.name
+        if safe != p.name:
+            _orig_names[safe] = p.name
+
     # Inner implementation — called via **kwargs after FastMCP unpacks args.
     async def _impl(**kwargs: Any) -> str:
-        log.info("proxy.%s: %s", tool_name, kwargs)
-        result = await client.call(tool_name, **kwargs)
+        # Restore original names for any sanitized keywords.
+        call_kwargs = {_orig_names.get(k, k): v for k, v in kwargs.items()}
+        log.info("proxy.%s: %s", tool_name, call_kwargs)
+        result = await client.call(tool_name, **call_kwargs)
         log.info("proxy.%s: done", tool_name)
         return str(result)
 
@@ -96,18 +107,4 @@ def _make_proxy(client: GameClient, tool: ToolSchema):
     required_params = [p for p in tool.params if p.required]
     optional_params = [p for p in tool.params if not p.required]
 
-    params: list[inspect.Parameter] = []
-    for p in required_params + optional_params:
-        py_type = _PY_TYPES.get(p.type, str)
-        if p.required:
-            param = inspect.Parameter(
-                p.name,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                annotation=py_type,
-            )
-        else:
-            param = inspect.Parameter(
-                p.name,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=_DEFAULTS.get(py_type, ""),
-   
+    params: list[inspect.Param
