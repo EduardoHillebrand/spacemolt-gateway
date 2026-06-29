@@ -11,6 +11,7 @@ Startup sequence (inside lifespan):
   6. client.disconnect() -- closes transport session cleanly
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -31,14 +32,20 @@ mcp = FastMCP(name="spacemolt-gateway")
 # Set by main() before mcp.run() so the lifespan closure can access it.
 _client: GameClient | None = None
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[None]:
     """Async startup: devlog -> transport connect -> proxy discovery -> skills."""
     await init_dev_logging(port=_DEV_LOG_PORT)
     if _client is not None:
-        await _client.connect()
-        await setup_proxy(mcp, _client)
+        try:
+            await _client.connect()
+            await setup_proxy(mcp, _client)
+        except Exception as exc:
+            log.error("lifespan: transport connect/proxy failed: %s", exc)
+        # Skills are always registered, even without a live transport.
         register_skills(mcp, _client)
     yield
     if _client is not None:
@@ -56,4 +63,22 @@ def build_client() -> GameClient:
     SPACEMOLT_SESSION_ID: session from spacemolt_auth (required for live use).
                           Falls back to stub-session for local testing.
     """
-    session_i
+    session_id = os.environ.get("SPACEMOLT_SESSION_ID", "stub-session")
+    url = os.environ.get("SPACEMOLT_URL")
+    if url:
+        from app.transports.streamable_http import StreamableHTTPTransport
+        transport: object = StreamableHTTPTransport(url)
+    else:
+        transport = StubTransport()
+    return GameClient(transport=transport, session_id=session_id)  # type: ignore[arg-type]
+
+
+def main() -> None:
+    """Build the client and run the gateway over stdio."""
+    global _client
+    _client = build_client()
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
