@@ -92,8 +92,12 @@ def _make_proxy(client: GameClient, tool: ToolSchema):
         return str(result)
 
     # Build inspect.Parameter list from ParamSchema list.
+    # Required params MUST come before optional ones — Python rejects the opposite.
+    required_params = [p for p in tool.params if p.required]
+    optional_params = [p for p in tool.params if not p.required]
+
     params: list[inspect.Parameter] = []
-    for p in tool.params:
+    for p in required_params + optional_params:
         py_type = _PY_TYPES.get(p.type, str)
         if p.required:
             param = inspect.Parameter(
@@ -106,11 +110,4 @@ def _make_proxy(client: GameClient, tool: ToolSchema):
                 p.name,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 default=_DEFAULTS.get(py_type, ""),
-                annotation=py_type,
-            )
-        params.append(param)
-
-    _impl.__signature__ = inspect.Signature(params, return_annotation=str)
-    _impl.__name__ = tool_name
-    _impl.__qualname__ = tool_name
-    return _impl
+   
