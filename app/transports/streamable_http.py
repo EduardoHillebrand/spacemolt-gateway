@@ -1,15 +1,20 @@
 """Real MCP transport via streamablehttp_client + ClientSession.
 
-Connects to the SpaceMolt MCP server at a given URL, implements throttling
-(300 ms min gap between calls) and retry on 429 (15 / 30 / 60 s backoff).
+On-demand connection model: instead of keeping a persistent GET SSE stream
+open (which the SpaceMolt server closes quickly, causing rapid reconnect
+loops), each call_tool / list_tools opens a fresh ClientSession, does the
+work, and closes it immediately.  No idle stream → no reconnect noise.
+
+Throttle (300 ms min gap) and retry on 429 (15 / 30 / 60 s backoff) are
+preserved as instance-level state so they still work across calls.
 
 Usage::
 
     transport = StreamableHTTPTransport("https://game.spacemolt.com/mcp")
-    await transport.connect()
-    result = await transport.call_tool("spacemolt", {"action": "mine", "session_id": "…"})
+    await transport.connect()    # no-op
+    result = await transport.call_tool("spacemolt", {"action": "mine", ...})
     tools  = await transport.list_tools()
-    await transport.disconnect()
+    await transport.disconnect() # no-op
 """
 
 from __future__ import annotations
@@ -18,8 +23,8 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import AsyncExitStack
-from typing import Any
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any, AsyncIterator
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -45,88 +50,83 @@ class SpaceMoltError(Exception):
 
 
 class StreamableHTTPTransport:
-    """MCPTransport that connects to SpaceMolt via streamable HTTP.
+    """MCPTransport that connects to SpaceMolt via on-demand streamable HTTP.
 
-    Implements ``connect`` / ``disconnect`` for lifecycle management, plus
-    ``call_tool`` and ``list_tools`` from the MCPTransport protocol.
+    A fresh MCP session is opened for every call_tool / list_tools call and
+    closed immediately afterwards.  This avoids the idle GET SSE reconnect
+    loop that occurs when a persistent session is kept open.
     """
 
     def __init__(self, url: str) -> None:
         self._url = url
-        self._session: ClientSession | None = None
-        self._exit_stack: AsyncExitStack | None = None
         self._last_call_t: float = 0.0
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Lifecycle (no-ops: on-demand model needs no persistent connection)
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
-        """Open the MCP session. Must be called before any call_tool / list_tools."""
-        self._exit_stack = AsyncExitStack()
-        transport = await self._exit_stack.enter_async_context(
-            streamablehttp_client(self._url)
-        )
-        read_stream, write_stream, _ = transport
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
-        await self._session.initialize()
-        log.info("StreamableHTTPTransport: connected to %s", self._url)
+        """No-op: sessions are opened per-call, not at startup."""
+        log.debug("StreamableHTTPTransport: on-demand mode, no persistent connection")
 
     async def disconnect(self) -> None:
-        """Close the MCP session cleanly."""
-        if self._exit_stack is not None:
-            try:
-                await asyncio.wait_for(self._exit_stack.aclose(), timeout=5.0)
-            except Exception as exc:
-                log.warning("StreamableHTTPTransport: disconnect error: %s", exc)
-            finally:
-                self._exit_stack = None
-                self._session = None
-        log.info("StreamableHTTPTransport: disconnected")
+        """No-op: no persistent session to close."""
+
+    # ------------------------------------------------------------------
+    # Internal: open a fresh session for one operation
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def _open_session(self) -> AsyncIterator[ClientSession]:
+        """Open a fresh MCP session, yield it, then close on exit."""
+        async with AsyncExitStack() as stack:
+            transport = await stack.enter_async_context(
+                streamablehttp_client(self._url)
+            )
+            read_stream, write_stream, _ = transport
+            session = await stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
+            yield session
 
     # ------------------------------------------------------------------
     # MCPTransport protocol
     # ------------------------------------------------------------------
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool, parse the response, throttle, and retry on 429."""
-        if self._session is None:
-            raise RuntimeError("Not connected — call connect() first")
-
+        """Call a tool on a fresh session, throttle, and retry on 429."""
         # Throttle: ensure minimum gap between consecutive calls
         now = time.monotonic()
         gap = now - self._last_call_t
         if gap < _MIN_CALL_GAP_S:
             await asyncio.sleep(_MIN_CALL_GAP_S - gap)
 
-        # Call with 429 retry backoff
-        for attempt in range(len(_RETRY_WAITS) + 1):
-            try:
-                raw = await self._session.call_tool(tool_name, arguments)
-                self._last_call_t = time.monotonic()
-                break
-            except Exception as exc:
-                s = str(exc).lower()
-                is_rate_limit = "429" in s or "too many requests" in s
-                if is_rate_limit and attempt < len(_RETRY_WAITS):
-                    wait = _RETRY_WAITS[attempt]
-                    log.warning(
-                        "call_tool %s: rate-limited (attempt %d), waiting %ds",
-                        tool_name, attempt + 1, wait,
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    raise
+        async with self._open_session() as session:
+            for attempt in range(len(_RETRY_WAITS) + 1):
+                try:
+                    raw = await session.call_tool(tool_name, arguments)
+                    self._last_call_t = time.monotonic()
+                    break
+                except Exception as exc:
+                    s = str(exc).lower()
+                    is_rate_limit = "429" in s or "too many requests" in s
+                    if is_rate_limit and attempt < len(_RETRY_WAITS):
+                        wait = _RETRY_WAITS[attempt]
+                        log.warning(
+                            "call_tool %s: rate-limited (attempt %d), waiting %ds",
+                            tool_name, attempt + 1, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
 
         return _parse_content(raw)
 
     async def list_tools(self) -> list[ToolSchema]:
         """Return the list of tools from the MCP server as ToolSchema objects."""
-        if self._session is None:
-            raise RuntimeError("Not connected — call connect() first")
-        response = await self._session.list_tools()
+        async with self._open_session() as session:
+            response = await session.list_tools()
         return [_tool_to_schema(t) for t in response.tools]
 
 

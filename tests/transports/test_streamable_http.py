@@ -1,13 +1,16 @@
 """Unit tests for StreamableHTTPTransport.
 
-All tests inject a fake MCP session — no real network connection needed.
-connect() / disconnect() are integration-tested in the manual check (task 022).
+On-demand model: each call_tool / list_tools opens its own session.
+Tests patch ``streamablehttp_client`` and ``ClientSession`` to inject a fake
+session — no real network connection needed.
 """
 
 from __future__ import annotations
 
-import asyncio
+import time
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,11 +50,49 @@ def _make_mcp_tool(name: str, description: str, properties: dict, required: list
     )
 
 
-def _transport_with_session(session) -> StreamableHTTPTransport:
-    """Create a transport and inject a fake session (skip connect())."""
-    t = StreamableHTTPTransport("http://fake")
-    t._session = session
-    return t
+def _make_session(*, call_tool_return: Any = None, list_tools_return: Any = None,
+                  call_tool_side_effect: Any = None) -> AsyncMock:
+    """Build a fake ClientSession."""
+    session = AsyncMock()
+    session.initialize = AsyncMock()
+    if call_tool_side_effect is not None:
+        session.call_tool = AsyncMock(side_effect=call_tool_side_effect)
+    elif call_tool_return is not None:
+        session.call_tool = AsyncMock(return_value=call_tool_return)
+    if list_tools_return is not None:
+        session.list_tools = AsyncMock(return_value=list_tools_return)
+    return session
+
+
+@contextmanager
+def _patch_open_session(session):
+    """Patch _open_session to yield *session* directly."""
+    @asynccontextmanager
+    async def fake_open_session(self):
+        yield session
+
+    with patch.object(StreamableHTTPTransport, "_open_session", fake_open_session):
+        yield
+
+
+def _transport() -> StreamableHTTPTransport:
+    return StreamableHTTPTransport("http://fake")
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle — no-ops
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_connect_is_noop():
+    t = _transport()
+    await t.connect()   # must not raise
+
+
+@pytest.mark.asyncio
+async def test_disconnect_is_noop():
+    t = _transport()
+    await t.disconnect()   # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +149,6 @@ def test_tool_to_schema_converts_correctly():
     schema = _tool_to_schema(tool)
     assert schema.name == "spacemolt"
     assert schema.description == "The main tool"
-    # session_id must be stripped
     names = [p.name for p in schema.params]
     assert "session_id" not in names
     assert "action" in names
@@ -146,11 +186,10 @@ async def test_list_tools_converts_mcp_schema():
         },
         required=["action"],
     )
-    session = AsyncMock()
-    session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[fake_tool]))
-    transport = _transport_with_session(session)
+    session = _make_session(list_tools_return=SimpleNamespace(tools=[fake_tool]))
 
-    schemas = await transport.list_tools()
+    with _patch_open_session(session):
+        schemas = await _transport().list_tools()
 
     assert len(schemas) == 1
     assert isinstance(schemas[0], ToolSchema)
@@ -165,34 +204,27 @@ async def test_list_tools_converts_mcp_schema():
 
 @pytest.mark.asyncio
 async def test_call_tool_parses_text_content():
-    session = AsyncMock()
-    session.call_tool = AsyncMock(return_value=_make_raw_response('{"ok": true}'))
-    transport = _transport_with_session(session)
-
-    result = await transport.call_tool("spacemolt", {"action": "mine", "session_id": "s"})
+    session = _make_session(call_tool_return=_make_raw_response('{"ok": true}'))
+    with _patch_open_session(session):
+        result = await _transport().call_tool("spacemolt", {"action": "mine"})
     assert result == {"ok": True}
 
 
 @pytest.mark.asyncio
 async def test_call_tool_parses_plain_text():
-    session = AsyncMock()
-    session.call_tool = AsyncMock(return_value=_make_raw_response("travelling..."))
-    transport = _transport_with_session(session)
-
-    result = await transport.call_tool("spacemolt", {"action": "travel"})
+    session = _make_session(call_tool_return=_make_raw_response("travelling..."))
+    with _patch_open_session(session):
+        result = await _transport().call_tool("spacemolt", {"action": "travel"})
     assert result == {"result": "travelling..."}
 
 
 @pytest.mark.asyncio
 async def test_call_tool_raises_spacemolt_error():
-    session = AsyncMock()
-    session.call_tool = AsyncMock(
-        return_value=_make_raw_response('{"error": {"code": "DOCKED", "message": "already docked"}}')
-    )
-    transport = _transport_with_session(session)
-
-    with pytest.raises(SpaceMoltError) as exc_info:
-        await transport.call_tool("spacemolt", {"action": "dock"})
+    raw = _make_raw_response('{"error": {"code": "DOCKED", "message": "already docked"}}')
+    session = _make_session(call_tool_return=raw)
+    with _patch_open_session(session):
+        with pytest.raises(SpaceMoltError) as exc_info:
+            await _transport().call_tool("spacemolt", {"action": "dock"})
     assert exc_info.value.code == "DOCKED"
 
 
@@ -202,22 +234,19 @@ async def test_call_tool_raises_spacemolt_error():
 
 @pytest.mark.asyncio
 async def test_throttle_sleeps_between_calls():
-    session = AsyncMock()
-    session.call_tool = AsyncMock(return_value=_make_raw_response('{"ok": true}'))
-    transport = _transport_with_session(session)
+    session = _make_session(call_tool_return=_make_raw_response('{"ok": true}'))
+    t = _transport()
+    t._last_call_t = time.monotonic()   # simulate a call that just happened
 
     slept: list[float] = []
 
     async def fake_sleep(duration: float) -> None:
         slept.append(duration)
 
-    with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
-        # Force _last_call_t to "just now" so the gap is zero
-        import time
-        transport._last_call_t = time.monotonic()
-        await transport.call_tool("spacemolt", {"action": "status"})
+    with _patch_open_session(session):
+        with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
+            await t.call_tool("spacemolt", {"action": "status"})
 
-    # Should have slept to fill the 300 ms gap
     assert len(slept) == 1
     assert slept[0] > 0
 
@@ -228,42 +257,38 @@ async def test_throttle_sleeps_between_calls():
 
 @pytest.mark.asyncio
 async def test_retry_on_429():
-    session = AsyncMock()
-    good_response = _make_raw_response('{"ok": true}')
-    # First call raises 429, second succeeds
-    session.call_tool = AsyncMock(
-        side_effect=[Exception("HTTP 429 Too Many Requests"), good_response]
+    good = _make_raw_response('{"ok": true}')
+    session = _make_session(
+        call_tool_side_effect=[Exception("HTTP 429 Too Many Requests"), good]
     )
-    transport = _transport_with_session(session)
 
     slept: list[float] = []
 
     async def fake_sleep(duration: float) -> None:
         slept.append(duration)
 
-    with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
-        result = await transport.call_tool("spacemolt", {"action": "mine"})
+    with _patch_open_session(session):
+        with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
+            result = await _transport().call_tool("spacemolt", {"action": "mine"})
 
     assert result == {"ok": True}
     assert session.call_tool.call_count == 2
-    # Should have slept the first backoff wait (15 s)
     assert any(s == 15 for s in slept)
 
 
 @pytest.mark.asyncio
 async def test_retry_exhausted_reraises():
-    session = AsyncMock()
-    session.call_tool = AsyncMock(side_effect=Exception("429 rate limit"))
-    transport = _transport_with_session(session)
+    session = _make_session(call_tool_side_effect=Exception("429 rate limit"))
 
     async def fake_sleep(_: float) -> None:
         pass
 
-    with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
-        with pytest.raises(Exception, match="429"):
-            await transport.call_tool("spacemolt", {})
+    with _patch_open_session(session):
+        with patch("app.transports.streamable_http.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(Exception, match="429"):
+                await _transport().call_tool("spacemolt", {})
 
-    # 1 original + 3 retries = 4 calls
+    # 1 original + 3 retries = 4 attempts
     assert session.call_tool.call_count == 4
 
 
