@@ -107,4 +107,27 @@ def _make_proxy(client: GameClient, tool: ToolSchema):
     required_params = [p for p in tool.params if p.required]
     optional_params = [p for p in tool.params if not p.required]
 
-    params: list[inspect.Param
+    params: list[inspect.Parameter] = []
+    for p in required_params + optional_params:
+        py_type = _PY_TYPES.get(p.type, str)
+        # Sanitize Python reserved keywords (e.g. "class" -> "class_")
+        safe_name = p.name + "_" if keyword.iskeyword(p.name) else p.name
+        if p.required:
+            param = inspect.Parameter(
+                safe_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=py_type,
+            )
+        else:
+            param = inspect.Parameter(
+                safe_name,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=_DEFAULTS.get(py_type, ""),
+                annotation=py_type,
+            )
+        params.append(param)
+
+    _impl.__signature__ = inspect.Signature(params, return_annotation=str)
+    _impl.__name__ = tool_name
+    _impl.__qualname__ = tool_name
+    return _impl
