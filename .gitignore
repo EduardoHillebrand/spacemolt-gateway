@@ -16,3 +16,6 @@ config.local.*
 .DS_Store
 .idea/
 .vscode/
+
+# Output de debug local
+gateway_errors.txt
